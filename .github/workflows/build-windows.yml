@@ -1,0 +1,150 @@
+name: Build Windows Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional package version override, for example 1.9.0 (default reads wails.json)
+        required: false
+        type: string
+      release:
+        description: Publish setup + portable to a GitHub Release (tag V<version>)
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit/branch to build
+        required: false
+        type: string
+      version:
+        required: false
+        type: string
+      release:
+        required: false
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "V*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows amd64
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI and Go modules
+        run: |
+          # Prefetch via proxy.golang.org; publish.ps1 forces goproxy.cn, which is slow from GitHub runners.
+          go mod download
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Ensure NSIS
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) {
+            choco install nsis -y --no-progress
+          }
+
+      - name: Resolve version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          $v = "$env:VERSION_INPUT".Trim()
+          if (-not $v -and "$env:GITHUB_REF" -like 'refs/tags/V*') { $v = "$env:GITHUB_REF_NAME".Substring(1) }
+          if (-not $v) { $v = (Get-Content wails.json -Raw | ConvertFrom-Json).info.productVersion }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $v"
+
+      - name: Build setup + portable
+        env:
+          CI: "1"
+          NO_PAUSE: "1"
+          BROWSERSLIST_IGNORE_OLD_DATA: "1"
+          ANT_BROWSER_PUBLISH_BEST_COMPRESSION: "1"
+        run: ./bat/publish.ps1 -Target WINDOWS -WindowsFormat BOTH -Version "${{ steps.version.outputs.version }}"
+
+      - name: Validate outputs
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          foreach ($f in @("publish/output/AntBrowser-Setup-$v.exe", "publish/output/AntBrowser-$v-windows-amd64-portable.zip")) {
+            if (-not (Test-Path $f)) { throw "Missing $f" }
+            Write-Host ("{0}  {1:N1} MB" -f $f, ((Get-Item $f).Length / 1MB))
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ant-browser-windows-amd64-${{ steps.version.outputs.version }}
+          path: |
+            publish/output/AntBrowser-Setup-*.exe
+            publish/output/AntBrowser-*-windows-amd64-portable.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: inputs.release || startsWith(github.ref, 'refs/tags/V')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create or replace release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="V${VERSION}"
+          if [[ "$GITHUB_REF" == "refs/tags/$tag" ]]; then
+            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
+          else
+            # One release per version: rebuilds of the same version replace the previous assets and move the tag.
+            gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+            gh release create "$tag" --target "$SHA" --title "$tag" --generate-notes --latest
+          fi
+          gh release upload "$tag" release-artifacts/* --clobber
