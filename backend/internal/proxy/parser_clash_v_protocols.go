@@ -77,6 +77,12 @@ func buildOutboundFromClashVless(node map[string]interface{}) (map[string]interf
 			stream["grpcSettings"] = grpc
 		}
 	}
+	if network == "xhttp" {
+		stream["network"] = "xhttp"
+		if xhttp := buildClashXHTTPSettings(node); len(xhttp) > 0 {
+			stream["xhttpSettings"] = xhttp
+		}
+	}
 	if len(stream) > 0 {
 		out["streamSettings"] = stream
 	}

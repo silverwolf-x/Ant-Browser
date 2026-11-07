@@ -76,6 +76,20 @@ func buildClashGRPCSettings(node map[string]interface{}) map[string]interface{} 
 	return map[string]interface{}{"serviceName": serviceName}
 }
 
+func buildClashXHTTPSettings(node map[string]interface{}) map[string]interface{} {
+	xhttp := map[string]interface{}{}
+	opts := toStringMap(node["xhttp-opts"])
+	if opts == nil {
+		return xhttp
+	}
+	for _, key := range []string{"path", "host", "mode"} {
+		if value := getMapString(opts, key); value != "" {
+			xhttp[key] = value
+		}
+	}
+	return xhttp
+}
+
 func firstNonEmptyMapString(m map[string]interface{}, keys ...string) string {
 	for _, key := range keys {
 		if value := getMapString(m, key); value != "" {

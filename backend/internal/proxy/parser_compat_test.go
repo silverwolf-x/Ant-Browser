@@ -49,6 +49,60 @@ ws-opts:
 	}
 }
 
+func TestClashVlessRealityKeepsXHTTPTransport(t *testing.T) {
+	src := `
+name: vless-xhttp
+type: vless
+server: edge.example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000001
+tls: true
+servername: sni.example.com
+reality-opts:
+  public-key: public-key-1
+  short-id: abcd
+client-fingerprint: firefox
+network: xhttp
+xhttp-opts:
+  path: /assets/r8k2/
+  host: sni.example.com
+  mode: auto
+`
+
+	_, outbound, err := ParseProxyNode(src)
+	if err != nil {
+		t.Fatalf("ParseProxyNode returned error: %v", err)
+	}
+	stream := outbound["streamSettings"].(map[string]interface{})
+	if stream["network"] != "xhttp" {
+		t.Fatalf("network = %v, want xhttp", stream["network"])
+	}
+	if stream["security"] != "reality" {
+		t.Fatalf("security = %v, want reality", stream["security"])
+	}
+	xhttp := stream["xhttpSettings"].(map[string]interface{})
+	if xhttp["path"] != "/assets/r8k2/" || xhttp["host"] != "sni.example.com" || xhttp["mode"] != "auto" {
+		t.Fatalf("xhttpSettings = %#v", xhttp)
+	}
+}
+
+func TestVlessURIKeepsXHTTPTransport(t *testing.T) {
+	src := "vless://00000000-0000-0000-0000-000000000001@edge.example.com:443?security=reality&sni=sni.example.com&fp=chrome&pbk=public-key-1&sid=abcd&type=xhttp&path=%2Fxh&host=sni.example.com&mode=auto#XHTTP"
+
+	_, outbound, err := ParseProxyNode(src)
+	if err != nil {
+		t.Fatalf("ParseProxyNode returned error: %v", err)
+	}
+	stream := outbound["streamSettings"].(map[string]interface{})
+	if stream["network"] != "xhttp" {
+		t.Fatalf("network = %v, want xhttp", stream["network"])
+	}
+	xhttp := stream["xhttpSettings"].(map[string]interface{})
+	if xhttp["path"] != "/xh" || xhttp["host"] != "sni.example.com" || xhttp["mode"] != "auto" {
+		t.Fatalf("xhttpSettings = %#v", xhttp)
+	}
+}
+
 func TestClashTrojanSkipCertVerifyUsesXrayPinMarker(t *testing.T) {
 	src := `
 name: trojan

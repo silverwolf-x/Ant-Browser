@@ -163,6 +163,18 @@ func buildOutboundVless(node string) (map[string]interface{}, error) {
 		}
 		stream["wsSettings"] = ws
 	}
+	if network == "xhttp" {
+		stream["network"] = "xhttp"
+		xhttp := map[string]interface{}{}
+		for _, key := range []string{"path", "host", "mode"} {
+			if value := q.Get(key); value != "" {
+				xhttp[key] = value
+			}
+		}
+		if len(xhttp) > 0 {
+			stream["xhttpSettings"] = xhttp
+		}
+	}
 	if len(stream) > 0 {
 		out["streamSettings"] = stream
 	}
