@@ -70,5 +70,5 @@ jobs:
     uses: ./.github/workflows/build-windows.yml
     with:
       ref: ${{ needs.sync.outputs.sha }}
-      release: true
+      release_type: rc
     secrets: inherit

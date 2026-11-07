@@ -4,14 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Optional package version override, for example 1.9.0 (default reads wails.json)
+        description: Optional base version override, for example 1.9.0 (default reads wails.json, i.e. upstream's version)
         required: false
         type: string
-      release:
-        description: Publish setup + portable to a GitHub Release (tag V<version>)
+      release_type:
+        description: "none = artifacts only; rc = prerelease V<version>-rc.N; final = release V<version>"
         required: false
-        type: boolean
-        default: false
+        type: choice
+        options:
+          - none
+          - rc
+          - final
+        default: none
   workflow_call:
     inputs:
       ref:
@@ -21,10 +25,10 @@ on:
       version:
         required: false
         type: string
-      release:
+      release_type:
         required: false
-        type: boolean
-        default: true
+        type: string
+        default: rc
   push:
     tags:
       - "V*"
@@ -41,7 +45,9 @@ jobs:
     name: Build Windows amd64
     runs-on: windows-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      label: ${{ steps.version.outputs.label }}
+      tag: ${{ steps.version.outputs.tag }}
+      mode: ${{ steps.version.outputs.mode }}
       sha: ${{ steps.version.outputs.sha }}
     defaults:
       run:
@@ -85,13 +91,35 @@ jobs:
         id: version
         env:
           VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
         run: |
-          $v = "$env:VERSION_INPUT".Trim()
-          if (-not $v -and "$env:GITHUB_REF" -like 'refs/tags/V*') { $v = "$env:GITHUB_REF_NAME".Substring(1) }
-          if (-not $v) { $v = (Get-Content wails.json -Raw | ConvertFrom-Json).info.productVersion }
-          "version=$v" >> $env:GITHUB_OUTPUT
+          # base  = numeric version baked into the exe/installer (follows upstream wails.json)
+          # label = version shown in tag and file names (base, base-rc.N, or the pushed tag)
+          if ("$env:GITHUB_REF" -like 'refs/tags/V*') {
+            $label = "$env:GITHUB_REF_NAME".Substring(1)
+            $base = ($label -split '-', 2)[0]
+            $mode = 'tag'
+          } else {
+            $base = "$env:VERSION_INPUT".Trim()
+            if (-not $base) { $base = (Get-Content wails.json -Raw | ConvertFrom-Json).info.productVersion }
+            $mode = if ($env:RELEASE_TYPE) { $env:RELEASE_TYPE } else { 'none' }
+            $label = $base
+            if ($mode -eq 'rc') {
+              $prefix = "refs/tags/V$base-rc."
+              $nums = git ls-remote --tags origin "$prefix*" | ForEach-Object {
+                $ref = ($_ -split "`t")[1]
+                if ($ref -match '^refs/tags/V.+-rc\.(\d+)$') { [int]$Matches[1] }
+              }
+              $next = 1 + (@($nums) + 0 | Measure-Object -Maximum).Maximum
+              $label = "$base-rc.$next"
+            }
+          }
+          "base=$base" >> $env:GITHUB_OUTPUT
+          "label=$label" >> $env:GITHUB_OUTPUT
+          "tag=V$label" >> $env:GITHUB_OUTPUT
+          "mode=$mode" >> $env:GITHUB_OUTPUT
           "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
-          Write-Host "Version: $v"
+          Write-Host "Base: $base  Label: $label  Mode: $mode"
 
       - name: Build setup + portable
         env:
@@ -99,20 +127,28 @@ jobs:
           NO_PAUSE: "1"
           BROWSERSLIST_IGNORE_OLD_DATA: "1"
           ANT_BROWSER_PUBLISH_BEST_COMPRESSION: "1"
-        run: ./bat/publish.ps1 -Target WINDOWS -WindowsFormat BOTH -Version "${{ steps.version.outputs.version }}"
+        run: ./bat/publish.ps1 -Target WINDOWS -WindowsFormat BOTH -Version "${{ steps.version.outputs.base }}"
 
-      - name: Validate outputs
+      - name: Name outputs and validate
         run: |
-          $v = "${{ steps.version.outputs.version }}"
-          foreach ($f in @("publish/output/AntBrowser-Setup-$v.exe", "publish/output/AntBrowser-$v-windows-amd64-portable.zip")) {
-            if (-not (Test-Path $f)) { throw "Missing $f" }
-            Write-Host ("{0}  {1:N1} MB" -f $f, ((Get-Item $f).Length / 1MB))
+          $base = "${{ steps.version.outputs.base }}"
+          $label = "${{ steps.version.outputs.label }}"
+          $pairs = @(
+            @("AntBrowser-Setup-$base.exe", "AntBrowser-Setup-$label.exe"),
+            @("AntBrowser-$base-windows-amd64-portable.zip", "AntBrowser-$label-windows-amd64-portable.zip")
+          )
+          foreach ($p in $pairs) {
+            $src = "publish/output/$($p[0])"
+            if (-not (Test-Path $src)) { throw "Missing $src" }
+            if ($p[0] -ne $p[1]) { Rename-Item $src $p[1] }
+            $dst = "publish/output/$($p[1])"
+            Write-Host ("{0}  {1:N1} MB" -f $dst, ((Get-Item $dst).Length / 1MB))
           }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ant-browser-windows-amd64-${{ steps.version.outputs.version }}
+          name: ant-browser-windows-amd64-${{ steps.version.outputs.label }}
           path: |
             publish/output/AntBrowser-Setup-*.exe
             publish/output/AntBrowser-*-windows-amd64-portable.zip
@@ -122,7 +158,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
-    if: inputs.release || startsWith(github.ref, 'refs/tags/V')
+    if: needs.build.outputs.mode != 'none'
     runs-on: ubuntu-latest
 
     steps:
@@ -132,20 +168,28 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
-      - name: Create or replace release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          MODE: ${{ needs.build.outputs.mode }}
           SHA: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
-          tag="V${VERSION}"
-          if [[ "$GITHUB_REF" == "refs/tags/$tag" ]]; then
-            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
-          else
-            # One release per version: rebuilds of the same version replace the previous assets and move the tag.
-            gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-            gh release create "$tag" --target "$SHA" --title "$tag" --generate-notes --latest
-          fi
-          gh release upload "$tag" release-artifacts/* --clobber
+          flags=(--title "$TAG" --generate-notes)
+          [[ "$TAG" == *-* ]] && flags+=(--prerelease) || flags+=(--latest)
+          case "$MODE" in
+            tag)
+              gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" "${flags[@]}"
+              ;;
+            final)
+              # One final release per version: rebuilding replaces assets and moves the tag.
+              gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+              gh release create "$TAG" --target "$SHA" "${flags[@]}"
+              ;;
+            rc)
+              gh release create "$TAG" --target "$SHA" "${flags[@]}"
+              ;;
+          esac
+          gh release upload "$TAG" release-artifacts/* --clobber
